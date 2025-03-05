@@ -1,4 +1,4 @@
-import openai
+import tiny_financial_advisor.openai as openai
 from typing import Dict, List, Optional
 from pydantic import BaseModel
 from datetime import datetime
