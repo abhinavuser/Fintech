@@ -470,3 +470,84 @@ class DatabaseManager:
             return result[0]
         except Exception as e:
             raise Exception(f"Error fetching user data: {str(e)}")
+        
+    def add_to_watchlist(self, account_number: str, symbol: str) -> Dict:
+        """Add a stock to user's watchlist."""
+        try:
+            with self.get_connection() as conn:
+                cur = conn.cursor()
+                
+                # Check if already in watchlist
+                cur.execute(
+                    "SELECT * FROM watchlist WHERE account_number = %s AND stock_symbol = %s",
+                    (account_number, symbol)
+                )
+                if cur.fetchone():
+                    return {
+                        "status": "error",
+                        "message": f"{symbol} is already in your watchlist"
+                    }
+                
+                # Add to watchlist
+                cur.execute(
+                    """
+                    INSERT INTO watchlist (account_number, stock_symbol)
+                    VALUES (%s, %s)
+                    """,
+                    (account_number, symbol)
+                )
+                
+                return {
+                    "status": "success",
+                    "message": f"{symbol} added to watchlist"
+                }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Database error: {str(e)}"
+            }
+
+    def remove_from_watchlist(self, account_number: str, symbol: str) -> Dict:
+        """Remove a stock from user's watchlist."""
+        try:
+            with self.get_connection() as conn:
+                cur = conn.cursor()
+                
+                cur.execute(
+                    """
+                    DELETE FROM watchlist 
+                    WHERE account_number = %s AND stock_symbol = %s
+                    RETURNING stock_symbol
+                    """,
+                    (account_number, symbol)
+                )
+                
+                if cur.fetchone():
+                    return {
+                        "status": "success",
+                        "message": f"{symbol} removed from watchlist"
+                    }
+                return {
+                    "status": "error",
+                    "message": f"{symbol} not found in watchlist"
+                }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Database error: {str(e)}"
+            }
+
+    def get_watchlist(self, account_number: str) -> List[Dict]:
+        """Get user's watchlist with current prices."""
+        try:
+            with self.get_connection() as conn:
+                cur = conn.cursor(cursor_factory=RealDictCursor)
+                
+                cur.execute(
+                    "SELECT * FROM watchlist WHERE account_number = %s",
+                    (account_number,)
+                )
+                return cur.fetchall()
+        except Exception as e:
+            print(f"Error getting watchlist: {e}")
+            return []
