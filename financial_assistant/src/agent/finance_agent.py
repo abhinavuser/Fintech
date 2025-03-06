@@ -189,6 +189,7 @@ class FinanceAgent:
             return "Your portfolio is empty."
         
         try:
+            # Convert Decimal to float for calculations
             total_value = sum(float(pos['shares']) * float(pos['current_price']) for pos in portfolio)
             total_cost = sum(float(pos['shares']) * float(pos['average_price']) for pos in portfolio)
             total_pl = total_value - total_cost
@@ -200,20 +201,33 @@ class FinanceAgent:
                 "Current Positions:"
             ]
             
+            # Group positions by symbol to avoid duplicates
+            positions = {}
             for pos in portfolio:
-                current_value = float(pos['shares']) * float(pos['current_price'])
-                cost_basis = float(pos['shares']) * float(pos['average_price'])
+                symbol = pos['stock_symbol']
+                if symbol not in positions:
+                    positions[symbol] = {
+                        'shares': float(pos['shares']),
+                        'average_price': float(pos['average_price']),
+                        'current_price': float(pos.get('current_price', pos['average_price']))
+                    }
+                else:
+                    positions[symbol]['shares'] += float(pos['shares'])
+            
+            for symbol, pos in positions.items():
+                current_value = pos['shares'] * pos['current_price']
+                cost_basis = pos['shares'] * pos['average_price']
                 position_pl = current_value - cost_basis
-                pl_percent = (position_pl / cost_basis) * 100 if cost_basis != 0 else 0
+                pl_percent = (position_pl / cost_basis * 100) if cost_basis != 0 else 0
                 
                 summary.append(
-                    f"- {pos['stock_symbol']}: {int(pos['shares'])} shares @ ${float(pos['average_price']):.2f} "
-                    f"(Current: ${float(pos['current_price']):.2f}, P/L: ${position_pl:.2f} / {pl_percent:.2f}%)"
+                    f"- {symbol}: {int(pos['shares'])} shares @ ${pos['average_price']:.2f} "
+                    f"(Current: ${pos['current_price']:.2f}, P/L: ${position_pl:.2f} / {pl_percent:.2f}%)"
                 )
             
             return "\n".join(summary)
         except Exception as e:
-            print(f"Error formatting portfolio: {str(e)}")
+            print(f"Error formatting portfolio: {e}")
             return "Error displaying portfolio."
 
     def set_current_user(self, account_number: str):
@@ -225,6 +239,9 @@ class FinanceAgent:
         try:
             # Handle casual conversation first
             query_lower = query.lower().strip()
+            words = query.lower().split()
+            if 'buy' in words or 'sell' in words:
+                return self._handle_trade_command(query)
             
             # Casual conversation patterns
             casual_patterns = {

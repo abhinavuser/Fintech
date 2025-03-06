@@ -266,15 +266,33 @@ class DatabaseManager:
         conn = None
         try:
             conn = self.get_connection()
-            cur = conn.cursor()
+            cur = conn.cursor(cursor_factory=RealDictCursor)
             
             # Start transaction
-            conn.autocommit = False
+            cur.execute("BEGIN")
             
-            # Calculate total amount
-            total_amount = shares * price
+            # Calculate total amount (use float for calculation, then convert to Decimal)
+            total_amount = float(shares) * float(price)
             
-            # Get current user balance and validate
+            # Get current position
+            cur.execute("""
+                SELECT SUM(shares) as total_shares
+                FROM portfolio 
+                WHERE account_number = %s AND stock_symbol = %s
+            """, (account_number, symbol))
+            
+            position = cur.fetchone()
+            current_shares = int(position['total_shares'] if position and position['total_shares'] else 0)
+            
+            # Validate trade
+            if trade_type == 'SELL' and current_shares < shares:
+                raise ValueError(
+                    f"Insufficient shares for this trade.\n"
+                    f"Required: {shares} shares\n"
+                    f"Available: {current_shares} shares"
+                )
+            
+            # Get and verify user balance
             cur.execute(
                 "SELECT balance FROM users WHERE account_number = %s FOR UPDATE",
                 (account_number,)
@@ -282,12 +300,19 @@ class DatabaseManager:
             user = cur.fetchone()
             
             if not user:
-                raise Exception("Account not found")
+                raise ValueError("Account not found")
             
+            current_balance = float(user['balance'])
+            
+            if trade_type == 'BUY' and current_balance < total_amount:
+                raise ValueError(
+                    f"Insufficient funds for this trade.\n"
+                    f"Required: ${total_amount:.2f}\n"
+                    f"Available: ${current_balance:.2f}"
+                )
+            
+            # Execute trade
             if trade_type == 'BUY':
-                if user['balance'] < total_amount:
-                    raise Exception(f"Insufficient funds. Need ${total_amount:.2f}, have ${user['balance']:.2f}")
-                
                 # Update balance
                 cur.execute(
                     "UPDATE users SET balance = balance - %s WHERE account_number = %s",
@@ -295,29 +320,24 @@ class DatabaseManager:
                 )
                 
                 # Update portfolio
-                cur.execute(
-                    """
-                    INSERT INTO portfolio (account_number, stock_symbol, shares, average_price)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (account_number, stock_symbol) DO UPDATE
-                    SET shares = portfolio.shares + %s,
-                        average_price = (portfolio.average_price * portfolio.shares + %s) / (portfolio.shares + %s),
-                        last_updated = CURRENT_TIMESTAMP
-                    """,
-                    (account_number, symbol, shares, price, shares, total_amount, shares)
-                )
-                
-            elif trade_type == 'SELL':
-                # Check if user has enough shares
-                cur.execute(
-                    "SELECT shares FROM portfolio WHERE account_number = %s AND stock_symbol = %s FOR UPDATE",
-                    (account_number, symbol)
-                )
-                portfolio = cur.fetchone()
-                
-                if not portfolio or portfolio['shares'] < shares:
-                    raise Exception(f"Insufficient shares. Have {portfolio['shares'] if portfolio else 0}, trying to sell {shares}")
-                
+                if current_shares > 0:
+                    # Update existing position
+                    cur.execute("""
+                        UPDATE portfolio 
+                        SET shares = shares + %s,
+                            average_price = (average_price * shares + %s) / (shares + %s),
+                            last_updated = CURRENT_TIMESTAMP
+                        WHERE account_number = %s AND stock_symbol = %s
+                    """, (shares, total_amount, shares, account_number, symbol))
+                else:
+                    # Insert new position
+                    cur.execute("""
+                        INSERT INTO portfolio 
+                        (account_number, stock_symbol, shares, average_price)
+                        VALUES (%s, %s, %s, %s)
+                    """, (account_number, symbol, shares, price))
+            
+            else:  # SELL
                 # Update balance
                 cur.execute(
                     "UPDATE users SET balance = balance + %s WHERE account_number = %s",
@@ -325,79 +345,124 @@ class DatabaseManager:
                 )
                 
                 # Update portfolio
-                cur.execute(
-                    """
+                cur.execute("""
                     UPDATE portfolio 
                     SET shares = shares - %s,
                         last_updated = CURRENT_TIMESTAMP
                     WHERE account_number = %s AND stock_symbol = %s
-                    """,
-                    (shares, account_number, symbol)
-                )
+                """, (shares, account_number, symbol))
                 
-                # Remove from portfolio if shares = 0
-                cur.execute(
-                    "DELETE FROM portfolio WHERE account_number = %s AND stock_symbol = %s AND shares = 0",
-                    (account_number, symbol)
-                )
+                # Clean up zero positions
+                cur.execute("""
+                    DELETE FROM portfolio 
+                    WHERE account_number = %s AND stock_symbol = %s AND shares <= 0
+                """, (account_number, symbol))
             
             # Record transaction
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO transactions 
-                (account_number, transaction_type, stock_symbol, shares, price_per_share, total_amount)
+                (account_number, transaction_type, stock_symbol, shares, 
+                 price_per_share, total_amount)
                 VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING transaction_id
-                """,
-                (account_number, trade_type, symbol, shares, price, total_amount)
-            )
+            """, (account_number, trade_type, symbol, shares, price, total_amount))
             
             transaction = cur.fetchone()
             
             # Commit transaction
-            conn.commit()
+            cur.execute("COMMIT")
             
             return {
                 "status": "success",
-                "message": f"Successfully {trade_type.lower()}ed {shares} shares of {symbol} at ${price:.2f} per share",
+                "message": (
+                    f"Successfully {trade_type.lower()}ed {shares} shares of {symbol} "
+                    f"at ${price:.2f} per share"
+                ),
                 "transaction_id": transaction['transaction_id']
             }
             
         except Exception as e:
             if conn:
-                conn.rollback()
+                cur.execute("ROLLBACK")
             return {"status": "error", "message": str(e)}
         finally:
             if conn:
                 conn.close()
-
+                
     def get_portfolio(self, account_number: str) -> List[Dict]:
-        """Get user's portfolio with current market values."""
+        """Get user's consolidated portfolio with current market values."""
         try:
-            # Get portfolio holdings
+            # Get consolidated portfolio holdings with single row per symbol
             query = """
-                SELECT p.*, 
-                       t.price_per_share as last_transaction_price,
-                       t.transaction_date as last_transaction_date
+                WITH latest_transactions AS (
+                    SELECT DISTINCT ON (account_number, stock_symbol)
+                        account_number, stock_symbol, price_per_share, transaction_date
+                    FROM transactions
+                    ORDER BY account_number, stock_symbol, transaction_date DESC
+                )
+                SELECT 
+                    p.stock_symbol,
+                    SUM(p.shares) as shares,  -- Sum total shares
+                    p.average_price,
+                    p.last_updated,
+                    lt.price_per_share as last_transaction_price,
+                    lt.transaction_date as last_transaction_date
                 FROM portfolio p
-                LEFT JOIN transactions t ON p.account_number = t.account_number 
-                    AND p.stock_symbol = t.stock_symbol
-                WHERE p.account_number = %s
-                ORDER BY p.stock_symbol
+                LEFT JOIN latest_transactions lt 
+                    ON p.account_number = lt.account_number 
+                    AND p.stock_symbol = lt.stock_symbol
+                WHERE p.account_number = %s AND p.shares > 0
+                GROUP BY 
+                    p.stock_symbol,
+                    p.average_price,
+                    p.last_updated,
+                    lt.price_per_share,
+                    lt.transaction_date
             """
             
             portfolio = self.execute_query(query, (account_number,))
             
+            # Convert to list of consolidated positions
+            consolidated = {}
+            for pos in portfolio:
+                symbol = pos['stock_symbol']
+                if symbol not in consolidated:
+                    consolidated[symbol] = {
+                        'stock_symbol': symbol,
+                        'shares': float(pos['shares']),
+                        'average_price': float(pos['average_price']),
+                        'last_updated': pos['last_updated'],
+                        'last_transaction_price': float(pos['last_transaction_price']) if pos['last_transaction_price'] else None,
+                        'last_transaction_date': pos['last_transaction_date']
+                    }
+                else:
+                    consolidated[symbol]['shares'] += float(pos['shares'])
+            
+            # Convert consolidated dict to list
+            portfolio = list(consolidated.values())
+            
             # Enrich with current market prices
             for position in portfolio:
-                quote = self.get_real_time_quote(position['stock_symbol'])
-                current_price = quote['price']
-                position['current_price'] = current_price
-                position['market_value'] = current_price * position['shares']
-                position['profit_loss'] = (current_price - position['average_price']) * position['shares']
-                position['profit_loss_percent'] = ((current_price / position['average_price']) - 1) * 100
+                try:
+                    quote = self.get_real_time_quote(position['stock_symbol'])
+                    current_price = float(quote['price'])
+                    shares = position['shares']
+                    avg_price = position['average_price']
+                    
+                    position['current_price'] = current_price
+                    position['market_value'] = current_price * shares
+                    position['profit_loss'] = (current_price - avg_price) * shares
+                    position['profit_loss_percent'] = ((current_price / avg_price) - 1) * 100 if avg_price > 0 else 0
+                    
+                except Exception as e:
+                    print(f"Error getting quote for {position['stock_symbol']}: {e}")
+                    position['current_price'] = position['average_price']
+                    position['market_value'] = position['average_price'] * shares
+                    position['profit_loss'] = 0
+                    position['profit_loss_percent'] = 0
             
             return portfolio
+            
         except Exception as e:
             print(f"Error fetching portfolio: {e}")
             return []
